@@ -462,6 +462,8 @@ def _build_normalized_signal_column(
     participant_id: str,
     column: str,
     signal_stats: dict[str, object],
+    can_bus_normalization: str = "legacy",
+    can_bus_stats: dict[str, dict[str, float]] | None = None,
 ) -> np.ndarray:
     parsed_values = np.asarray(
         [
@@ -491,6 +493,14 @@ def _build_normalized_signal_column(
     if not np.any(valid_mask):
         return normalized
     if column in CAN_BUS_SIGNAL_COLUMNS:
+        if can_bus_normalization == "zscore":
+            if can_bus_stats is None or column not in can_bus_stats:
+                raise ValueError(f"Missing training CAN statistics for {column}")
+            stats = can_bus_stats[column]
+            normalized[valid_mask] = (
+                parsed_values[valid_mask] - stats["mean"]
+            ) / stats["std"]
+            return normalized
         column_stats = signal_stats.get("can_bus", {}).get(column)
         if not column_stats:
             normalized[valid_mask] = parsed_values[valid_mask]
@@ -512,6 +522,8 @@ def _build_session_sequence(
     member_name: str,
     signal_columns: list[str],
     signal_stats: dict[str, object],
+    can_bus_normalization: str = "legacy",
+    can_bus_stats: dict[str, dict[str, float]] | None = None,
 ) -> _SessionSequence:
     participant_id = _participant_id_from_member_name(member_name)
     image_files = [str(row.get("ImageFile", "")) for row in rows]
@@ -534,6 +546,8 @@ def _build_session_sequence(
             participant_id=participant_id,
             column=column,
             signal_stats=signal_stats,
+            can_bus_normalization=can_bus_normalization,
+            can_bus_stats=can_bus_stats,
         )
         for column in signal_columns
     ]
@@ -557,10 +571,14 @@ class _TarSessionStore:
         *,
         signal_columns: list[str],
         signal_stats: dict[str, object],
+        can_bus_normalization: str = "legacy",
+        can_bus_stats: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.archive_path = archive_path
         self.signal_columns = signal_columns
         self.signal_stats = signal_stats
+        self.can_bus_normalization = can_bus_normalization
+        self.can_bus_stats = can_bus_stats
         self._tar: tarfile.TarFile | None = None
         self._cache: dict[str, _SessionSequence] = {}
 
@@ -587,6 +605,8 @@ class _TarSessionStore:
             member_name=member_name,
             signal_columns=self.signal_columns,
             signal_stats=self.signal_stats,
+            can_bus_normalization=self.can_bus_normalization,
+            can_bus_stats=self.can_bus_stats,
         )
         self._cache[member_name] = session
         return session
@@ -599,10 +619,14 @@ class _LocalSessionStore:
         *,
         signal_columns: list[str],
         signal_stats: dict[str, object],
+        can_bus_normalization: str = "legacy",
+        can_bus_stats: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.root = root
         self.signal_columns = signal_columns
         self.signal_stats = signal_stats
+        self.can_bus_normalization = can_bus_normalization
+        self.can_bus_stats = can_bus_stats
         self._cache: dict[str, _SessionSequence] = {}
 
     def get_session(self, member_name: str) -> _SessionSequence | None:
@@ -623,6 +647,8 @@ class _LocalSessionStore:
             member_name=normalized_name,
             signal_columns=self.signal_columns,
             signal_stats=self.signal_stats,
+            can_bus_normalization=self.can_bus_normalization,
+            can_bus_stats=self.can_bus_stats,
         )
         self._cache[normalized_name] = session
         return session
@@ -635,6 +661,8 @@ class _HybridSessionStore:
         *,
         signal_columns: list[str],
         signal_stats: dict[str, object],
+        can_bus_normalization: str = "legacy",
+        can_bus_stats: dict[str, dict[str, float]] | None = None,
         local_root: Path | None = None,
     ) -> None:
         self.local_store = None
@@ -643,11 +671,15 @@ class _HybridSessionStore:
                 local_root,
                 signal_columns=signal_columns,
                 signal_stats=signal_stats,
+                can_bus_normalization=can_bus_normalization,
+                can_bus_stats=can_bus_stats,
             )
         self.tar_store = _TarSessionStore(
             archive_path,
             signal_columns=signal_columns,
             signal_stats=signal_stats,
+            can_bus_normalization=can_bus_normalization,
+            can_bus_stats=can_bus_stats,
         )
 
     def get_session(self, member_name: str) -> _SessionSequence:
@@ -945,7 +977,13 @@ class HDBDPaperWindowDataset(Dataset):
         sample_ids: Iterable[int] | None = None,
         limit_samples: int | None = None,
         cache_dir: str | Path | None = None,
+        can_bus_normalization: str = "legacy",
+        can_bus_stats: dict[str, dict[str, float]] | None = None,
     ) -> None:
+        if can_bus_normalization not in {"legacy", "zscore"}:
+            raise ValueError("CAN normalization must be legacy or zscore")
+        if can_bus_normalization == "zscore" and can_bus_stats is None:
+            raise ValueError("zscore requires training CAN statistics")
         if heatmap_variant not in HEATMAP_ARCHIVES:
             raise ValueError(
                 f"Unsupported heatmap_variant={heatmap_variant!r}. "
@@ -958,6 +996,8 @@ class HDBDPaperWindowDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir else default_cache_dir()
         self.signal_stats_path = default_signal_stats_path()
         self.signal_columns = signal_columns or list(DEFAULT_SIGNAL_COLUMNS)
+        self.can_bus_normalization = can_bus_normalization
+        self.can_bus_stats = can_bus_stats
         self.heatmap_variant = heatmap_variant
         self.prefetched_root = default_prefetched_asset_root(self.cache_dir)
         self.prefetched_csv_root = self.prefetched_root / "csv"
@@ -1014,6 +1054,8 @@ class HDBDPaperWindowDataset(Dataset):
             self.csv_archive_path,
             signal_columns=self.signal_columns,
             signal_stats=self.signal_stats,
+            can_bus_normalization=can_bus_normalization,
+            can_bus_stats=can_bus_stats,
             local_root=csv_local_root,
         )
         self.seg_store = _HybridImageStore(

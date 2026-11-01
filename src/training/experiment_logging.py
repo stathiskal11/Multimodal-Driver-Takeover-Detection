@@ -83,6 +83,7 @@ class ExperimentRecorder:
                 "test_evaluation_checkpoint": {},
             }
         )
+        self._write_summary()
 
     def record_epoch(
         self,
@@ -113,6 +114,8 @@ class ExperimentRecorder:
         optimizer: torch.optim.Optimizer,
         train_metrics: Any,
         val_metrics: Any,
+        preprocessing: dict[str, Any] | None = None,
+        architecture: str = "baseline",
     ) -> Path:
         checkpoint_path = (
             self.checkpoints_dir
@@ -130,6 +133,9 @@ class ExperimentRecorder:
             "optimizer_state_dict": optimizer.state_dict(),
             "train_metrics": sanitize_for_json(train_metrics),
             "val_metrics": sanitize_for_json(val_metrics),
+            "preprocessing": preprocessing,
+            "architecture": architecture,
+            "args": self._summary["args"],
         }
         torch.save(payload, checkpoint_path)
         return checkpoint_path
@@ -154,12 +160,18 @@ class ExperimentRecorder:
         split_record["test_evaluation_checkpoint"] = sanitize_for_json(
             test_evaluation_checkpoint
         )
+        self._write_summary()
 
     def finalize(self, *, aggregate: dict[str, Any]) -> Path:
         self._summary["aggregate"] = sanitize_for_json(aggregate)
-        with self.summary_path.open("w", encoding="utf-8") as summary_file:
-            json.dump(self._summary, summary_file, indent=2)
+        self._write_summary()
         return self.summary_path
+
+    def _write_summary(self) -> None:
+        temporary_path = self.summary_path.with_suffix(".json.tmp")
+        with temporary_path.open("w", encoding="utf-8") as summary_file:
+            json.dump(self._summary, summary_file, indent=2)
+        temporary_path.replace(self.summary_path)
 
     def _find_split_record(self, split_seed: int) -> dict[str, Any]:
         for split_record in self._summary["splits"]:

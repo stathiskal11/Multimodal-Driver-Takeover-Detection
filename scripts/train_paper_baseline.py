@@ -7,9 +7,10 @@ import sys
 from argparse import Namespace
 from dataclasses import asdict
 from pathlib import Path
-from statistics import mean
+from statistics import mean, stdev
 from typing import Any
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -20,7 +21,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 from src.data import HDBDPaperWindowDataset, prefetch_subset_assets
 from src.evaluation import BinaryPredictionMetrics, summarize_binary_predictions
-from src.models import PaperTakeoverBaselineModel
+from src.models import PaperTakeoverBaselineModel, TransformerTakeoverModel
+from src.data.can_normalization import fit_can_zscore
+from src.data.hdbd_paper_dataset import CSV_ARCHIVE, ensure_inner_archive_cached, default_cache_dir, default_bundle_path
 from src.training import (
     ExperimentRecorder,
     SplitIndexSummary,
@@ -260,6 +263,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="Execution device. 'auto' prefers CUDA when available.",
     )
+    parser.add_argument("--architecture", choices=["baseline", "transformer"], default="baseline")
+    parser.add_argument("--can-normalization", choices=["legacy", "zscore"], default="legacy")
     apply_config_defaults(parser, config_defaults)
     args = parser.parse_args(argv)
     normalize_path_namespace(args)
@@ -274,6 +279,8 @@ def make_dataset(
     sample_ids: list[int] | None,
     limit_samples: int | None,
     cache_dir: Path | None,
+    can_bus_normalization: str = "legacy",
+    can_bus_stats: dict[str, dict[str, float]] | None = None,
 ) -> HDBDPaperWindowDataset:
     return HDBDPaperWindowDataset(
         index_csv_path=index_path,
@@ -283,6 +290,8 @@ def make_dataset(
         sample_ids=sample_ids,
         limit_samples=limit_samples,
         cache_dir=cache_dir,
+        can_bus_normalization=can_bus_normalization,
+        can_bus_stats=can_bus_stats,
     )
 
 
@@ -476,7 +485,7 @@ def load_checkpoint_into_model(
 
 
 def run_epoch(
-    model: PaperTakeoverBaselineModel,
+    model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None,
@@ -679,6 +688,22 @@ def run_single_split(
             ],
             allow_full_split_prefetch=args.prefetch_active_splits,
         )
+    can_stats = None
+    if args.can_normalization == "zscore" and not args.report_only:
+        train_index = pd.read_csv(
+            args.index,
+            usecols=["sample_id", "participant_id", "csv_member", "window_start_idx", "window_end_idx"],
+            dtype={"participant_id": "string", "csv_member": "string"},
+        )
+        train_index = train_index[train_index["participant_id"].isin(splits["train"])]
+        if train_sample_ids is not None:
+            train_index = train_index[train_index["sample_id"].isin(train_sample_ids)]
+        archive_path = ensure_inner_archive_cached(
+            args.bundle or default_bundle_path(), CSV_ARCHIVE,
+            (args.cache_dir or default_cache_dir()) / "Synced_csv_files-participant_level.tar.gz",
+        )
+        can_stats = fit_can_zscore(archive_path, train_index, splits["train"])
+        print(f"train_can_zscore_stats={can_stats}")
     train_dataset = make_dataset(
         index_path=args.index,
         bundle_path=args.bundle,
@@ -687,6 +712,8 @@ def run_single_split(
         sample_ids=train_sample_ids,
         limit_samples=None,
         cache_dir=args.cache_dir,
+        can_bus_normalization="legacy" if args.report_only else args.can_normalization,
+        can_bus_stats=can_stats,
     )
     val_dataset = make_dataset(
         index_path=args.index,
@@ -696,6 +723,8 @@ def run_single_split(
         sample_ids=val_sample_ids,
         limit_samples=None,
         cache_dir=args.cache_dir,
+        can_bus_normalization="legacy" if args.report_only else args.can_normalization,
+        can_bus_stats=can_stats,
     )
     test_dataset = None
     if args.evaluate_test:
@@ -707,6 +736,8 @@ def run_single_split(
             sample_ids=test_sample_ids,
             limit_samples=None,
             cache_dir=args.cache_dir,
+            can_bus_normalization="legacy" if args.report_only else args.can_normalization,
+            can_bus_stats=can_stats,
         )
     active_datasets = {
         "train": train_dataset,
@@ -773,7 +804,7 @@ def run_single_split(
             num_workers=args.num_workers,
             pin_memory=pin_memory,
         )
-    model = PaperTakeoverBaselineModel().to(device)
+    model = (PaperTakeoverBaselineModel() if args.architecture == "baseline" else TransformerTakeoverModel()).to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     print(f"device={device}")
@@ -826,6 +857,8 @@ def run_single_split(
                 optimizer=optimizer,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
+                preprocessing={"can_normalization": args.can_normalization, "can_stats": can_stats},
+                architecture=args.architecture,
             )
             last_checkpoint_info = {
                 "path": str(last_checkpoint_path),
@@ -846,6 +879,8 @@ def run_single_split(
                     optimizer=optimizer,
                     train_metrics=train_metrics,
                     val_metrics=val_metrics,
+                    preprocessing={"can_normalization": args.can_normalization, "can_stats": can_stats},
+                    architecture=args.architecture,
                 )
                 best_checkpoint_info = {
                     "path": str(best_checkpoint_path),
@@ -964,6 +999,15 @@ def main() -> None:
             "metrics": [asdict(metrics) for metrics in test_metric_list],
         }
         print(aggregate["test"]["text"])
+        auc_by_seed = {
+            str(result["split_seed"]): result["test_metrics"].roc_auc
+            for result in split_results if result["test_metrics"] is not None
+        }
+        valid_auc = [value for value in auc_by_seed.values() if value is not None]
+        aggregate["test_roc_auc_by_seed"] = auc_by_seed
+        aggregate["test_roc_auc_mean"] = mean(valid_auc) if valid_auc else None
+        aggregate["test_roc_auc_std"] = stdev(valid_auc) if len(valid_auc) > 1 else None
+        aggregate["best_single_test_roc_auc"] = max(valid_auc) if valid_auc else None
     if args.num_split_groups <= 1:
         aggregate["single_split"] = True
     summary_path = recorder.finalize(aggregate=aggregate)
